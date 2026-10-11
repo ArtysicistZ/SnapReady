@@ -1,0 +1,5 @@
+opencv-python<5   # OpenCV 5 dropped the Haar cascades used by the baseline
+mediapipe
+numpy
+pandas            # benchmark only
+pyarrow           # benchmark only
