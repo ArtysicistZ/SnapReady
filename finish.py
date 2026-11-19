@@ -5,7 +5,7 @@ import mediapipe as mp
 import numpy as np
 from mediapipe.tasks.python import BaseOptions, vision
 
-from check import CHIN, FOREHEAD, LEFT_EYE, RIGHT_EYE, download_model
+from check import CHIN, FOREHEAD, LEFT_EYE, NOSE_BRIDGE, RIGHT_EYE, download_model
 
 SEGMENTER_MODEL = "image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite"
 
@@ -26,11 +26,14 @@ class Finisher:
 
     def __call__(self, bgr, points):
         """Photo and its face landmarks -> PHOTO_SIZE x PHOTO_SIZE passport photo."""
-        # 1. Person mask from the selfie segmenter.
+        # 1. Person mask from the selfie segmenter, keeping only the region that contains
+        #    our face, so people in the background are removed.
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         result = self.segmenter.segment(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
         confidence = np.squeeze(result.confidence_masks[-1].numpy_view())
-        person = (confidence > 0.5).astype(np.float32)
+        _, regions = cv2.connectedComponents((confidence > 0.5).astype(np.uint8))
+        nose_x, nose_y = points[NOSE_BRIDGE].astype(int)
+        person = (regions == regions[nose_y, nose_x]).astype(np.float32)
 
         # 2. Similarity transform (lecture 5): level the eyes, scale the head, place the eye line.
         left_eye = points[list(LEFT_EYE)].mean(axis=0)

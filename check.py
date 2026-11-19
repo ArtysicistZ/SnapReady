@@ -25,6 +25,15 @@ FACE_OVAL = [
 ]
 
 IRIS_DIAMETER_MM = 11.7   # almost the same for every adult
+# Mirrored landmark pairs (image left, image right): eye corners, mouth corners, face sides, brows.
+# The head tilt is the mean angle of the lines joining them.
+LEFT_SIDE = [33, 133, 61, 234, 70]
+RIGHT_SIDE = [263, 362, 291, 454, 300]
+# Mirrored cheek landmarks: the same skin on both sides, compared for even lighting.
+LEFT_CHEEK = [50, 205, 117, 123, 147, 187, 36, 101, 118]
+RIGHT_CHEEK = [280, 425, 346, 352, 376, 411, 266, 330, 347]
+FACE_WIDTH = 112   # sharpness is measured on the face at this width (about the benchmark faces),
+                   # so its fitted limit holds at any distance from the camera
 
 
 def download_model(path):
@@ -70,7 +79,7 @@ class Checker:
         rotation = np.array(result.facial_transformation_matrixes[0])[:3, :3]
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
-        # face outline: its bounding box gives position and a crop for sharpness
+        # face outline: its bounding box gives a crop for sharpness, its inside a mask for light
         oval = points[FACE_OVAL]
         x_min, y_min = oval.min(axis=0).clip(0).astype(int)
         x_max, y_max = oval.max(axis=0).astype(int)
@@ -78,21 +87,26 @@ class Checker:
         cv2.fillPoly(face_mask, [oval.astype(np.int32)], 1)
         face_mask = face_mask.astype(bool)
 
-        # lighting: compare the two halves of the face, split at the nose
-        left_half = face_mask.copy()
-        left_half[:, int(points[NOSE_BRIDGE, 0]):] = False
-        left_light = np.median(gray[left_half]) + 1
-        right_light = np.median(gray[face_mask & ~left_half]) + 1
+        # lighting: mean brightness around mirrored cheek points (a box filter, i.e. a convolution).
+        # Comparing the same skin on both sides keeps hair, background and head turn out.
+        patch = 2 * int(0.08 * (x_max - x_min)) + 1
+        local = cv2.blur(gray.astype(np.float32), (patch, patch)) + 1
+        x, y = points.clip(0, [width - 1, height - 1]).astype(int).T
+        left_light = local[y[LEFT_CHEEK], x[LEFT_CHEEK]].sum()
+        right_light = local[y[RIGHT_CHEEK], x[RIGHT_CHEEK]].sum()
 
-        # sharpness = variance of the Laplacian (a convolution, HW1) on the face only,
-        # resized to a fixed width so the distance to the camera does not matter
-        face = gray[y_min:y_max, x_min:x_max]
-        face = cv2.resize(face, (256, max(1, round(256 * face.shape[0] / face.shape[1]))))
+        # sharpness = share of the edge strength that one more blur removes (re-blur): a sharp
+        # face loses a lot, a blurry one little. Being a ratio, contrast cancels out.
+        face = gray[y_min:y_max, x_min:x_max].astype(np.float32)   # no rounding of faint edges
+        face = cv2.resize(face, (FACE_WIDTH, max(1, round(FACE_WIDTH * face.shape[0] / face.shape[1]))),
+                          interpolation=cv2.INTER_AREA)
+        reblurred = cv2.GaussianBlur(face, (0, 0), 2)
 
         # head angles from the rotation of MediaPipe's 3D face model
         turn = np.degrees(np.arctan2(-rotation[2, 0], np.hypot(rotation[0, 0], rotation[1, 0])))
         nod = np.degrees(np.arctan2(rotation[2, 1], rotation[2, 2]))
-        eye_line = points[RIGHT_EYE[1]] - points[LEFT_EYE[0]]
+        level_lines = points[RIGHT_SIDE] - points[LEFT_SIDE]
+        eyes_center = (points[RIGHT_EYE[1]] + points[LEFT_EYE[0]]) / 2   # the spec places the eye line
 
         # distance from the iris size, pinhole camera (lecture 1): focal * real size / image size
         distance_cm = None
@@ -104,13 +118,18 @@ class Checker:
             "points": points,
             "distance_cm": distance_cm,
             "face_height": (points[CHIN, 1] - points[FOREHEAD, 1]) / height,
-            "offset_x": ((x_min + x_max) / 2 - width / 2) / width,
-            "offset_y": ((y_min + y_max) / 2 - height / 2) / width,
+            "offset_x": (eyes_center[0] - width / 2) / width,
+            "offset_y": (eyes_center[1] - height / 2) / width,
             "head_turn": turn,
             "head_nod": nod,
-            "head_tilt": np.degrees(np.arctan2(eye_line[1], eye_line[0])),
+            "head_tilt": np.degrees(np.arctan2(level_lines[:, 1], level_lines[:, 0])).mean(),
             "eye_closure": max(blendshapes["eyeBlinkLeft"], blendshapes["eyeBlinkRight"]),
-            "brightness": np.median(gray[face_mask]),
+            "brightness": np.percentile(gray[face_mask], 90),   # lit skin, not beard or brows
             "shadow_ratio": max(left_light, right_light) / min(left_light, right_light),
-            "sharpness": cv2.Laplacian(face, cv2.CV_64F).var(),
+            "sharpness": 1 - edge_strength(reblurred) / edge_strength(face),
         }
+
+
+def edge_strength(gray):
+    """Mean gradient magnitude, from Sobel convolutions (HW2)."""
+    return np.hypot(cv2.Sobel(gray, cv2.CV_64F, 1, 0), cv2.Sobel(gray, cv2.CV_64F, 0, 1)).mean()

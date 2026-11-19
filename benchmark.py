@@ -1,11 +1,13 @@
 """Compare the baseline with v1 on public data, and fit the rule limits in config.json.
 
-    python benchmark.py        # the first run downloads ~650 MB of data into data/
+    python benchmark.py        # the first run downloads ~900 MB of data into data/
 
 Test data, each split in half: "calib" (fit the limits) and "test" (report accuracy).
   LFW faces, damaged on purpose  -> framing, blur, exposure, shadow, tilt
+    (funneled LFW: aligned by congealing, independent of both analyzers, so the undamaged
+     photos are level and centered; we also even out their lighting, so "good" means good)
   Pointing'04 head-pose photos   -> facing (bad if turned or nodded more than 15 degrees)
-  Open/closed eyes (AI faces)    -> eyes
+  Open/closed eyes (AI faces)    -> eyes, with the undamaged LFW photos as real open eyes
 A frame where no face is found fails every check.
 """
 
@@ -13,6 +15,7 @@ import io
 import itertools
 import json
 import os
+import tarfile
 import urllib.request
 
 import cv2
@@ -26,8 +29,8 @@ from guide import passes
 HERE = os.path.dirname(os.path.abspath(__file__))
 HUGGING_FACE = "https://huggingface.co/datasets/"
 EYE_FILES = ["001", "050", "100", "400", "700", "800", "900", "950", "990"]
+LFW_URL = "https://ndownloader.figshare.com/files/5976015"   # lfw-funneled.tgz
 DATA_URLS = {
-    "lfw": HUGGING_FACE + "logasja/lfw/resolve/main/data/train-00000-of-00001.parquet",
     "pose": HUGGING_FACE + "StevenLe456/head-pose/resolve/main/data/train-00000-of-00003.parquet",
 }
 for number in EYE_FILES:
@@ -35,8 +38,7 @@ for number in EYE_FILES:
         HUGGING_FACE + f"MichalMlodawski/closed-open-eyes/resolve/main/data/dataset_{number}.parquet")
 
 N_PEOPLE = 600     # LFW people (one photo each)
-CROP = 180         # LFW crop around the face, in pixels
-SIZE = 320         # test image size
+CROP = 180         # LFW crop around the face = test image size, in pixels (no resizing blur)
 
 # Each check is scored with these rule limits (measurement, limit type); the app uses the same rules.
 CHECK_RULES = {
@@ -53,12 +55,32 @@ GRID_POINTS = {1: 400, 2: 150, 3: 40}
 MEASUREMENTS = sorted({measurement for rules in CHECK_RULES.values() for measurement, _ in rules})
 
 
-def download(name):
-    path = os.path.join(HERE, "data", name + ".parquet")
+def fetch(url, filename):
+    """Local path of a data file, downloaded on first use."""
+    path = os.path.join(HERE, "data", filename)
     if not os.path.exists(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        urllib.request.urlretrieve(DATA_URLS[name], path)
-    return pd.read_parquet(path)
+        urllib.request.urlretrieve(url, path)
+    return path
+
+
+def download(name):
+    return pd.read_parquet(fetch(DATA_URLS[name], name + ".parquet"))
+
+
+def lfw_photos():
+    """One funneled LFW photo per person, with even lighting, for N_PEOPLE people."""
+    with tarfile.open(fetch(LFW_URL, "lfw-funneled.tgz")) as tar:
+        names = sorted(m.name for m in tar.getmembers() if m.name.endswith("_0001.jpg"))
+        for name in np.random.default_rng(0).choice(names, N_PEOPLE, replace=False):
+            yield even_light(decode(tar.extractfile(name).read()))
+
+
+def even_light(image):
+    """Make the lighting left-right symmetric. Image = detail x light, where the light is a
+    heavy blur; the light becomes the geometric mean of itself and its mirror image."""
+    light = cv2.GaussianBlur(image.astype(np.float32) + 1, (0, 0), 20)
+    return np.clip(image * np.sqrt(light[:, ::-1] / light), 0, 255).astype(np.uint8)
 
 
 def decode(image_bytes):
@@ -67,10 +89,10 @@ def decode(image_bytes):
 
 
 def crop(image, dx=0, dy=0):
-    """CROP x CROP window around the image center (shifted by dx, dy), resized to SIZE."""
+    """CROP x CROP window around the image center, shifted by dx, dy."""
     x = (image.shape[1] - CROP) // 2 + dx
     y = (image.shape[0] - CROP) // 2 + dy
-    return cv2.resize(image[y:y + CROP, x:x + CROP], (SIZE, SIZE), interpolation=cv2.INTER_CUBIC)
+    return image[y:y + CROP, x:x + CROP]
 
 
 def damaged_versions(image, rng):
@@ -93,7 +115,7 @@ def damaged_versions(image, rng):
     for gain, bad in [(0.8, 0), (1.15, 0), (0.35, 1), (2.0, 1)]:
         yield "exposure", bad, np.clip(base * gain, 0, 255).astype(np.uint8)
 
-    x = np.linspace(-1, 1, SIZE)
+    x = np.linspace(-1, 1, CROP)
     for darkest, bad in [(0.85, 0), (0.35, 1)]:
         ramp = darkest + (1 - darkest) * np.clip((x / 0.6 + 1) / 2, 0, 1)   # across the face
         if rng.random() < 0.5:
@@ -110,10 +132,9 @@ def damaged_versions(image, rng):
 
 def test_cases():
     rng = np.random.default_rng(0)
-    lfw = download("lfw").drop_duplicates("label").sample(N_PEOPLE, random_state=0)
-    for i, image in enumerate(lfw["image"]):
+    for i, image in enumerate(lfw_photos()):
         split = "calib" if i < N_PEOPLE // 2 else "test"
-        for check, bad, damaged in damaged_versions(decode(image["bytes"]), rng):
+        for check, bad, damaged in damaged_versions(image, rng):
             yield {"source": "lfw", "split": split, "check": check, "bad": bad, "image": damaged}
 
     pose = download("pose")
@@ -129,7 +150,7 @@ def test_cases():
             split = "calib" if i % 2 == 0 else "test"
             bad = int(label == "closed_eyes")
             yield {"source": "eyes", "split": split, "check": "eyes", "bad": bad,
-                   "image": cv2.resize(decode(image["file"]), (SIZE, SIZE))}
+                   "image": cv2.resize(decode(image["file"]), (CROP, CROP))}
 
 
 class Baseline:
@@ -218,10 +239,10 @@ def main():
     v1_rules = {"distance_cm": {"min": 50}, "face_height": {"min": 0.20}}   # set by hand
     for name, rows in data.groupby("analyzer"):
         for check, bounds in CHECK_RULES.items():
-            if check in ("facing", "eyes"):
+            if check == "facing":
                 selected = rows[rows["check"] == check]
-            else:
-                selected = rows[(rows["source"] == "lfw") & rows["check"].isin([check, "*"])]
+            else:   # undamaged LFW photos are good examples for every other check, eyes included
+                selected = rows[rows["check"].isin([check, "*"])]
             calib = selected[selected["split"] == "calib"]
             test = selected[selected["split"] == "test"]
 
